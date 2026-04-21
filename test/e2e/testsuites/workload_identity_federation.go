@@ -193,7 +193,7 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		// Note: verify the exact log string on first run if this assertion fails:
 		//   kubectl logs <pod> -c gke-gcsfuse-sidecar | grep -i "403\|permission\|PERMISSION"
 		ginkgo.By("Checking that gcsfuse logs a permission denied error from GCS")
-		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PERMISSION_DENIED")
+		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PermissionDenied")
 	}
 
 	// testCaseWIFReadOnlyRoleWriteFails verifies that write operations fail when the WI principal
@@ -282,7 +282,7 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		defer tPod.Cleanup(ctx)
 
 		ginkgo.By("Checking that gcsfuse logs a permission denied error for the test bucket")
-		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PERMISSION_DENIED")
+		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PermissionDenied")
 	}
 
 	// testCaseWIFRoleRevokedMidSession verifies that file operations fail after the WI principal's
