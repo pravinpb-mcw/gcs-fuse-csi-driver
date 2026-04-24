@@ -365,6 +365,19 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		ginkgo.By("Verifying write fails after role revocation")
 		tPod.VerifyExecInPodFail(f, specs.TesterContainerName,
 			fmt.Sprintf("echo 'post-revoke' > %v/wif-post-revoke.txt", wifMountPath), 1)
+
+		// Re-grant the role and verify writes resume — confirms the access loss was due
+		// to the IAM change and not a permanent pod or gcsfuse failure.
+		ginkgo.By("Re-granting objectUser access to bucket")
+		grantBucketAccess(bucketName, authCtx.principal, "roles/storage.objectUser")
+		revoked = false
+
+		ginkgo.By("Waiting for IAM re-grant to propagate")
+		time.Sleep(60 * time.Second)
+
+		ginkgo.By("Verifying write succeeds after role is restored")
+		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+			fmt.Sprintf("echo 'post-restore' > %v/wif-post-restore.txt", wifMountPath))
 	}
 
 	ginkgo.It("should fail GCS access when WI principal has no storage role", func() {
