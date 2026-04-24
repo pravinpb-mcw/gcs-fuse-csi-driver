@@ -169,6 +169,7 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 
 		// GKE path: native Workload Identity via GSA impersonation.
 		gsaName := wifGSANameForNamespace(f.Namespace.Name)
+		ginkgo.By(fmt.Sprintf("Creating GCP service account: %s", gsaName))
 		gsaEmail := createGSAForWIF(projectID, gsaName)
 
 		ginkgo.By(fmt.Sprintf("Binding KSA %s to GSA %s via workloadIdentityUser", wifServiceAccountName, gsaEmail))
@@ -176,6 +177,9 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 
 		ginkgo.By(fmt.Sprintf("Creating annotated Kubernetes service account: %s", wifServiceAccountName))
 		createServiceAccountWithGSAAnnotationForWIF(ctx, f, wifServiceAccountName, gsaEmail)
+
+		ginkgo.By("Waiting for Workload Identity binding to propagate")
+		time.Sleep(60 * time.Second)
 
 		return wiAuthContext{
 			principal: "serviceAccount:" + gsaEmail,
@@ -292,7 +296,7 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		defer func() {
 			ginkgo.By(fmt.Sprintf("Deleting alternate bucket: %s", altBucket))
 			deleteCmd := exec.Command("gcloud", "storage", "buckets", "delete",
-				"gs://"+altBucket, "--quiet")
+				"gs://"+altBucket, "--project="+projectID, "--quiet")
 			if out, err := deleteCmd.CombinedOutput(); err != nil {
 				klog.Warningf("Failed to delete alternate bucket %s: %v, output: %s", altBucket, err, string(out))
 			}
@@ -326,7 +330,13 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		defer cleanupWIAuth(authCtx)
 
 		ginkgo.By("Granting objectUser access to bucket")
+		revoked := false
 		grantBucketAccess(bucketName, authCtx.principal, "roles/storage.objectUser")
+		defer func() {
+			if !revoked {
+				revokeBucketAccess(bucketName, authCtx.principal, "roles/storage.objectUser")
+			}
+		}()
 
 		ginkgo.By("Waiting for IAM policy propagation")
 		time.Sleep(5 * time.Second)
@@ -345,6 +355,7 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		// Revoke the IAM role immediately (not deferred — intentional mid-session revocation).
 		ginkgo.By("Revoking bucket access mid-session")
 		revokeBucketAccess(bucketName, authCtx.principal, "roles/storage.objectUser")
+		revoked = true
 
 		// Wait for IAM propagation and credential cache expiry.
 		// If this test is flaky, increase the sleep to match the token cache TTL.
