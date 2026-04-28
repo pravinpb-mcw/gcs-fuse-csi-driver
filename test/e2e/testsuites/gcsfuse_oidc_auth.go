@@ -366,6 +366,55 @@ func (t *gcsFuseCSIOIDCTestSuite) DefineTests(driver storageframework.TestDriver
 		tPod.WaitForFailedMountError(ctx, "PermissionDenied")
 	}
 
+	testCaseOIDCMultiPodSameFedConfig := func() {
+		init(specs.SkipCSIBucketAccessCheckPrefix)
+		defer cleanup()
+		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
+		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attribute")
+		projectNumber, credentialConfig := setupOIDCInfrastructure()
+		setupOIDCKubernetesResources(credentialConfig)
+		defer cleanupOIDCKubernetesResources()
+
+		grantOIDCBucketAccess(bucketName, projectNumber)
+		defer revokeOIDCBucketAccess(bucketName, projectNumber)
+		const podCount = 3
+		tPods := make([]*specs.TestPod, podCount)
+
+		for i := 0; i < podCount; i++ {
+				ginkgo.By(fmt.Sprintf("Configuring test pod %d with OIDC authentication", i))
+				tPod := specs.NewTestPodModifiedSpec(f.ClientSet, f.Namespace, true)
+				tPod.SetServiceAccount(oidcServiceAccountName)
+				tPod.SetupVolume(l.volumeResource, oidcVolumeName, oidcMountPath, false)
+				tPod.SetAnnotations(map[string]string{
+						webhook.GCPWorkloadIdentityCredentialConfigMapAnnotation: oidcConfigMapName,
+				})
+				tPods[i] = tPod
+		}
+		for i, tPod := range tPods {
+				ginkgo.By(fmt.Sprintf("Deploying pod %d", i))
+				tPod.Create(ctx)
+				defer tPod.Cleanup(ctx)
+		}
+		for i, tPod := range tPods {
+				ginkgo.By(fmt.Sprintf("Checking pod %d is running", i))
+				tPod.WaitForRunning(ctx)
+		}
+		for i, tPod := range tPods {
+				ginkgo.By(fmt.Sprintf("Verifying pod %d volume is mounted", i))
+				tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("mount | grep %v | grep rw,", oidcMountPath))
+				ginkgo.By(fmt.Sprintf("Writing a test file from pod %d", i))
+				testFileName := fmt.Sprintf("oidc-multi-pod-test-file-%d.txt", i)
+				testContent := fmt.Sprintf("Hello from OIDC pod %d with same federation config!", i)
+				tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,fmt.Sprintf("echo '%s' > %s/%s", testContent, oidcMountPath, testFileName))
+				ginkgo.By(fmt.Sprintf("Reading the test file from pod %d", i))
+				readOutput := tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName,fmt.Sprintf("cat %s/%s", oidcMountPath, testFileName))
+				gomega.Expect(strings.TrimSpace(readOutput)).To(gomega.Equal(testContent))
+				ginkgo.By(fmt.Sprintf("Cleaning up test file from pod %d", i))
+				tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName, fmt.Sprintf("rm %s/%s", oidcMountPath, testFileName))
+		}
+    }
+ 
+
 	ginkgo.It("should successfully mount with OIDC authentication", func() {
 		testCaseOIDCMount()
 	})
@@ -385,6 +434,10 @@ func (t *gcsFuseCSIOIDCTestSuite) DefineTests(driver storageframework.TestDriver
 	ginkgo.It("should fail when CSI bucket access check is enabled with OIDC authentication", func() {
 		testCaseOIDCWithCSIBucketAccessCheck()
 	})
+
+	ginkgo.It("should successfully authenticate multiple pods using same federation configuration", func() {
+        testCaseOIDCMultiPodSameFedConfig()
+    })
 }
 
 // Helper functions for GCP operations
