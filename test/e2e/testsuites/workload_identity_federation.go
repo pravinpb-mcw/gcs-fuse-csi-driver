@@ -1,6 +1,6 @@
 /*
 Copyright 2018 The Kubernetes Authors.
-Copyright 2025 Google LLC
+Copyright 2026 Google LLC
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ package testsuites
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -31,10 +33,13 @@ import (
 	"github.com/googlecloudplatform/gcs-fuse-csi-driver/pkg/webhook"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
+	iam "google.golang.org/api/iam/v1"
+	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/klog/v2"
+	"k8s.io/apimachinery/pkg/util/wait"
+	klog "k8s.io/klog/v2"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
 	storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
@@ -42,37 +47,25 @@ import (
 )
 
 const (
-	wifWorkloadIdentityPoolID     = "gcs-fuse-oidc-pool"     // reuse existing pool (idempotent)
-	wifWorkloadIdentityProviderID = "gcs-fuse-oidc-provider" // reuse existing provider (idempotent)
-	wifServiceAccountName         = "gcs-fuse-wif-ksa"
-	wifVolumeName                 = "gcs-wif-volume"
-	wifMountPath                  = "/mnt/gcs"
-	wifNoRoleConfigMapName        = "wif-credentials-no-role"
-	wifReadOnlyConfigMapName      = "wif-credentials-readonly"
-	wifWrongBucketConfigMapName   = "wif-credentials-wrong-bucket"
+	wifWorkloadIdentityPoolID     = "gcs-fuse-oidc-pool"
+	wifWorkloadIdentityProviderID = "gcs-fuse-oidc-provider"
+	// wifFakeProviderID is a WIF provider configured with a deliberately wrong
+	// issuer URI. Any STS token exchange against it will always fail with an
+	// "invalid_token" error, giving a guaranteed authentication failure that
+	// does not depend on the node service account's GCS permissions.
+	wifFakeProviderID = "wif-fake-provider"
+	wifFakeIssuerURI  = "https://fake-oidc-issuer.example.com"
 )
 
-// wiAuthContext holds the auth-mechanism-specific values for a test case.
-// On OSS clusters (IS_OSS=true), external WIF is used: principal is a federated identity URL,
-// and a ConfigMap holds the credential config JSON.
-// On GKE clusters, native Workload Identity is used: principal is a GSA email,
-// and the KSA is annotated with iam.gke.io/gcp-service-account.
-type wiAuthContext struct {
-	principal     string // IAM member string used for bucket grants
-	configMapName string // non-empty on OSS only (external WIF credential config)
-	gsaEmail      string // non-empty on GKE only (native WI GSA)
-	projectID     string // retained for GSA cleanup on GKE
-}
-
-type gcsFuseCSIWIFTestSuite struct {
+type gcsFuseCSIWorkloadIdentityFederationTestSuite struct {
 	tsInfo storageframework.TestSuiteInfo
 }
 
-// InitGcsFuseCSIWIFTestSuite returns gcsFuseCSIWIFTestSuite that implements TestSuite interface.
-func InitGcsFuseCSIWIFTestSuite() storageframework.TestSuite {
-	return &gcsFuseCSIWIFTestSuite{
+// InitGcsFuseCSIWorkloadIdentityFederationTestSuite returns a suite with WIF-focused tests.
+func InitGcsFuseCSIWorkloadIdentityFederationTestSuite() storageframework.TestSuite {
+	return &gcsFuseCSIWorkloadIdentityFederationTestSuite{
 		tsInfo: storageframework.TestSuiteInfo{
-			Name: "wif",
+			Name: "workload-identity-federation",
 			TestPatterns: []storageframework.TestPattern{
 				storageframework.DefaultFsCSIEphemeralVolume,
 			},
@@ -80,14 +73,14 @@ func InitGcsFuseCSIWIFTestSuite() storageframework.TestSuite {
 	}
 }
 
-func (t *gcsFuseCSIWIFTestSuite) GetTestSuiteInfo() storageframework.TestSuiteInfo {
+func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) GetTestSuiteInfo() storageframework.TestSuiteInfo {
 	return t.tsInfo
 }
 
-func (t *gcsFuseCSIWIFTestSuite) SkipUnsupportedTests(_ storageframework.TestDriver, _ storageframework.TestPattern) {
+func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) SkipUnsupportedTests(_ storageframework.TestDriver, _ storageframework.TestPattern) {
 }
 
-func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
+func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver storageframework.TestDriver, pattern storageframework.TestPattern) {
 	type local struct {
 		config         *storageframework.PerTestConfig
 		volumeResource *storageframework.VolumeResource
@@ -95,7 +88,7 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 	var l local
 	ctx := context.Background()
 
-	f := framework.NewFrameworkWithCustomTimeouts("wif", storageframework.GetDriverTimeouts(driver))
+	f := framework.NewFrameworkWithCustomTimeouts("workload-identity-federation", storageframework.GetDriverTimeouts(driver))
 	f.NamespacePodSecurityEnforceLevel = admissionapi.LevelPrivileged
 
 	init := func(configPrefix ...string) {
@@ -114,130 +107,138 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		framework.ExpectNoError(err, "while cleaning up")
 	}
 
-	// setupWIAuth sets up authentication infrastructure and Kubernetes resources for the test.
-	// On OSS clusters (IS_OSS=true): creates WIF pool/provider, credential config ConfigMap,
-	// and a plain KSA. The bucket IAM principal is a federated identity URL.
-	// On GKE clusters: creates a GSA, binds the KSA to it via workloadIdentityUser,
-	// and creates a KSA annotated with iam.gke.io/gcp-service-account.
-	// The bucket IAM principal is the GSA email.
-	// configMapName is only used on OSS; it is ignored on GKE.
-	setupWIAuth := func(configMapName string) wiAuthContext {
+	initWithCSIBucketAccessCheckSkipped := func() {
+		// Mount should succeed; authz failures surface on I/O, matching the OIDC test flow.
+		init(specs.SkipCSIBucketAccessCheckPrefix)
+
+		if l.volumeResource == nil || l.volumeResource.VolSource == nil || l.volumeResource.VolSource.CSI == nil {
+			framework.Failf("volume resource not initialized properly")
+		}
+		if l.volumeResource.VolSource.CSI.VolumeAttributes == nil {
+			l.volumeResource.VolSource.CSI.VolumeAttributes = map[string]string{}
+		}
+		l.volumeResource.VolSource.CSI.VolumeAttributes["skipCSIBucketAccessCheck"] = "true"
+	}
+
+	// setupOSSWIFPrincipal creates all OSS Workload Identity Federation infrastructure
+	// (WIF pool, provider, KSA, credential ConfigMap) for ksaName and returns the
+	// WIF principal string. Cleanup is registered via ginkgo.DeferCleanup.
+	setupOSSWIFPrincipal := func(ksaName, poolID, providerID, configMapName string) string {
 		projectID := os.Getenv(utils.ProjectEnvVar)
 		gomega.Expect(projectID).NotTo(gomega.BeEmpty(), fmt.Sprintf("%s environment variable must be set", utils.ProjectEnvVar))
 
-		if os.Getenv(utils.IsOSSEnvVar) == "true" {
-			// OSS path: external WIF via credential config ConfigMap.
-			ginkgo.By("Getting GCP project number")
-			projectNumber := getProjectNumber(projectID)
-			gomega.Expect(projectNumber).NotTo(gomega.BeEmpty(), "Failed to get project number")
+		ginkgo.By("Getting GCP project number")
+		projectNumber := getProjectNumber(projectID)
+		gomega.Expect(projectNumber).NotTo(gomega.BeEmpty(), "failed to get project number")
 
-			ginkgo.By("Getting cluster information")
-			clusterName := os.Getenv(utils.ClusterNameEnvVar)
-			clusterLocation := os.Getenv(utils.ClusterLocationEnvVar)
-			gomega.Expect(clusterName).NotTo(gomega.BeEmpty(), fmt.Sprintf("%s environment variable must be set", utils.ClusterNameEnvVar))
-			gomega.Expect(clusterLocation).NotTo(gomega.BeEmpty(), fmt.Sprintf("%s environment variable must be set", utils.ClusterLocationEnvVar))
+		ginkgo.By(fmt.Sprintf("Creating workload identity pool: %s", poolID))
+		createWorkloadIdentityPool(projectID, poolID)
 
-			ginkgo.By(fmt.Sprintf("Creating workload identity pool: %s", wifWorkloadIdentityPoolID))
-			createWorkloadIdentityPool(projectID, wifWorkloadIdentityPoolID)
+		ginkgo.By("Discovering cluster OIDC issuer from cluster service account token")
+		clusterIssuer := getOSSClusterOIDCIssuer(ctx, f)
+		gomega.Expect(clusterIssuer).NotTo(gomega.BeEmpty(), "failed to discover cluster OIDC issuer")
 
-			ginkgo.By("Getting cluster OIDC issuer URL")
-			clusterIssuer := getClusterOIDCIssuer(clusterName, clusterLocation, projectID)
-			gomega.Expect(clusterIssuer).NotTo(gomega.BeEmpty(), "Failed to get cluster OIDC issuer")
+		ginkgo.By(fmt.Sprintf("Creating workload identity provider: %s", providerID))
+		createWorkloadIdentityProvider(projectID, poolID, providerID, clusterIssuer)
 
-			ginkgo.By(fmt.Sprintf("Creating workload identity provider: %s", wifWorkloadIdentityProviderID))
-			createWorkloadIdentityProvider(projectID, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, clusterIssuer)
+		ginkgo.By("Generating credential configuration")
+		credentialConfig := generateCredentialConfig(projectNumber, poolID, providerID)
 
-			ginkgo.By("Generating credential configuration")
-			credentialConfig := generateCredentialConfig(projectNumber, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID)
+		ginkgo.By(fmt.Sprintf("Creating Kubernetes service account: %s", ksaName))
+		createServiceAccount(ctx, f, ksaName)
+		ginkgo.DeferCleanup(func() { deleteServiceAccount(ctx, f, ksaName) })
 
-			ginkgo.By(fmt.Sprintf("Creating Kubernetes service account: %s", wifServiceAccountName))
-			createServiceAccount(ctx, f, wifServiceAccountName)
+		ginkgo.By(fmt.Sprintf("Creating credential ConfigMap: %s", configMapName))
+		createCredentialConfigMap(ctx, f, configMapName, credentialConfig)
+		ginkgo.DeferCleanup(func() { deleteConfigMap(ctx, f, configMapName) })
 
-			ginkgo.By(fmt.Sprintf("Creating ConfigMap: %s", configMapName))
-			createCredentialConfigMap(ctx, f, configMapName, credentialConfig)
-
-			principal := fmt.Sprintf(
-				"principal://iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s/subject/system:serviceaccount:%s:%s",
-				projectNumber, wifWorkloadIdentityPoolID, f.Namespace.Name, wifServiceAccountName)
-
-			return wiAuthContext{
-				principal:     principal,
-				configMapName: configMapName,
-			}
-		}
-
-		// GKE path: native Workload Identity via GSA impersonation.
-		gsaName := wifGSANameForNamespace(f.Namespace.Name)
-		ginkgo.By(fmt.Sprintf("Creating GCP service account: %s", gsaName))
-		gsaEmail := createGSAForWIF(projectID, gsaName)
-
-		ginkgo.By(fmt.Sprintf("Binding KSA %s to GSA %s via workloadIdentityUser", wifServiceAccountName, gsaEmail))
-		bindKSAToGSAForWIF(projectID, gsaEmail, f.Namespace.Name, wifServiceAccountName)
-
-		ginkgo.By(fmt.Sprintf("Creating annotated Kubernetes service account: %s", wifServiceAccountName))
-		createServiceAccountWithGSAAnnotationForWIF(ctx, f, wifServiceAccountName, gsaEmail)
-
-		ginkgo.By("Waiting for Workload Identity binding to propagate")
-		time.Sleep(60 * time.Second)
-
-		return wiAuthContext{
-			principal: "serviceAccount:" + gsaEmail,
-			gsaEmail:  gsaEmail,
-			projectID: projectID,
-		}
+		return fmt.Sprintf(
+			"principal://iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s/subject/system:serviceaccount:%s:%s",
+			projectNumber, poolID, f.Namespace.Name, ksaName,
+		)
 	}
 
-	// cleanupWIAuth deletes the K8s and GCP resources created by setupWIAuth.
-	cleanupWIAuth := func(authCtx wiAuthContext) {
-		deleteServiceAccount(ctx, f, wifServiceAccountName)
-		if authCtx.configMapName != "" {
-			deleteConfigMap(ctx, f, authCtx.configMapName)
+	// setupGKEWIPrincipal creates a GCP service account, binds it to ksaName via
+	// roles/iam.workloadIdentityUser, and creates the annotated KSA. Returns the
+	// GSA principal string. Cleanup is registered via ginkgo.DeferCleanup.
+	setupGKEWIPrincipal := func(ksaName string) string {
+		rawProjectID := os.Getenv(utils.ProjectEnvVar)
+		gomega.Expect(rawProjectID).NotTo(gomega.BeEmpty(), "PROJECT must be set")
+
+		// Strip any Cloud Shell "Your active configuration is: [...]" warning prefix.
+		lines := strings.Split(strings.TrimSpace(rawProjectID), "\n")
+		projectID := lines[len(lines)-1]
+
+		gomega.Expect(strings.Contains(projectID, "Your active configuration")).To(gomega.BeFalse(),
+			fmt.Sprintf("invalid projectID detected: %q", projectID))
+
+		saName := f.Namespace.Name
+		if len(saName) > 30 {
+			saName = saName[:30]
 		}
-		if authCtx.gsaEmail != "" {
-			deleteGSAForWIF(authCtx.projectID, authCtx.gsaEmail)
-		}
+		testGcpSA := utils.NewTestGCPServiceAccount(saName, projectID)
+		ginkgo.By(fmt.Sprintf("Creating GCP service account: %s", saName))
+		testGcpSA.Create(ctx)
+		ginkgo.DeferCleanup(func() { testGcpSA.Cleanup(ctx) })
+
+		ginkgo.By(fmt.Sprintf("Binding KSA %s to GCP service account %s with roles/iam.workloadIdentityUser", ksaName, testGcpSA.GetEmail()))
+		addWorkloadIdentityBinding(ctx, testGcpSA.GetEmail(), projectID, f.Namespace.Name, ksaName)
+
+		ginkgo.By(fmt.Sprintf("Creating Kubernetes service account %s annotated with GCP service account %s", ksaName, testGcpSA.GetEmail()))
+		testK8sSA := utils.NewTestKubernetesServiceAccount(f.ClientSet, f.Namespace, ksaName, testGcpSA.GetEmail())
+		testK8sSA.Create(ctx)
+		ginkgo.DeferCleanup(func() { testK8sSA.Cleanup(ctx) })
+
+		ginkgo.By("Waiting for Workload Identity binding to propagate globally (~60s)")
+		time.Sleep(2 * time.Minute)
+
+		return "serviceAccount:" + testGcpSA.GetEmail()
 	}
 
-	// deployWIFPod creates a test pod configured for the appropriate auth mechanism.
-	// On OSS, the pod is annotated with the credential config ConfigMap name.
-	// On GKE, no annotation is needed — native WI is picked up via the KSA annotation.
-	deployWIFPod := func(authCtx wiAuthContext) *specs.TestPod {
+	// deployWIFPod creates a test pod with the appropriate WIF credential annotation (OSS only)
+	// and mounts the volume.
+	deployWIFPod := func(ksaName, credentialConfigMapName, volumeName, mountPath string) *specs.TestPod {
 		tPod := specs.NewTestPodModifiedSpec(f.ClientSet, f.Namespace, true)
-		tPod.SetServiceAccount(wifServiceAccountName)
-		tPod.SetupVolume(l.volumeResource, wifVolumeName, wifMountPath, false)
-		if authCtx.configMapName != "" {
+		tPod.SetServiceAccount(ksaName)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		if credentialConfigMapName != "" {
 			tPod.SetAnnotations(map[string]string{
-				webhook.GCPWorkloadIdentityCredentialConfigMapAnnotation: authCtx.configMapName,
+				webhook.GCPWorkloadIdentityCredentialConfigMapAnnotation: credentialConfigMapName,
 			})
 		}
 		tPod.Create(ctx)
 		return tPod
 	}
 
-	// testCaseWIFNoStorageRole verifies that GCS access fails when the WI principal has no
-	// storage role on the bucket. Authentication succeeds; GCS returns PermissionDenied.
-	// When the sidecar bucket access check is enabled, the check fires at mount time and
-	// the pod never reaches Running — we verify the PermissionDenied mount error instead.
-	testCaseWIFNoStorageRole := func() {
+	ginkgo.It("should fail GCS access when WI principal has no storage role", func() {
 		init(specs.SkipCSIBucketAccessCheckPrefix)
 		defer cleanup()
 
-		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
-		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attributes")
+		const (
+			wifKSA        = "wif-no-role-ksa"
+			configMapName = "wif-credentials-no-role"
+			volumeName    = "gcs-wif-volume"
+			mountPath     = "/mnt/gcs"
+		)
 
-		authCtx := setupWIAuth(wifNoRoleConfigMapName)
-		defer cleanupWIAuth(authCtx)
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
+		var principal string
+		if isOSS {
+			principal = setupOSSWIFPrincipal(wifKSA, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, configMapName)
+		} else {
+			principal = setupGKEWIPrincipal(wifKSA)
+		}
+		_ = principal // intentionally no bucket IAM role granted
 
-		// Intentionally do NOT grant any bucket IAM role.
-		// Authentication will succeed but GCS will reject all bucket operations.
-
-		ginkgo.By("Deploying test pod with WI credentials but no bucket IAM role")
-		tPod := deployWIFPod(authCtx)
+		tPod := deployWIFPod(wifKSA, func() string {
+			if isOSS {
+				return configMapName
+			}
+			return ""
+		}(), volumeName, mountPath)
 		defer tPod.Cleanup(ctx)
 
 		if os.Getenv(utils.TestWithSidecarBucketAccessCheckEnvVar) == "true" {
-			// Sidecar bucket access check fires at mount time: the pod stays Pending
-			// with a PermissionDenied FailedMount event — it never reaches Running.
 			ginkgo.By("Checking that the sidecar bucket access check returns PermissionDenied")
 			tPod.WaitForFailedMountError(ctx, "PermissionDenied")
 		} else {
@@ -245,86 +246,109 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 			ginkgo.By("Checking that gcsfuse logs a permission denied error from GCS")
 			tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PermissionDenied")
 		}
-	}
+	})
 
-	// testCaseWIFReadOnlyRoleWriteFails verifies that write operations fail when the WI principal
-	// only has objectViewer (read-only) on the bucket. Reads succeed; writes are rejected by GCS.
-	testCaseWIFReadOnlyRoleWriteFails := func() {
+	ginkgo.It("should fail write operations when WI principal has read-only storage role", func() {
 		init(specs.SkipCSIBucketAccessCheckPrefix)
 		defer cleanup()
 
 		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
 		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attributes")
 
-		authCtx := setupWIAuth(wifReadOnlyConfigMapName)
-		defer cleanupWIAuth(authCtx)
+		const (
+			wifKSA        = "wif-readonly-ksa"
+			configMapName = "wif-credentials-readonly"
+			volumeName    = "gcs-wif-volume"
+			mountPath     = "/mnt/gcs"
+		)
+
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
+		var principal string
+		if isOSS {
+			principal = setupOSSWIFPrincipal(wifKSA, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, configMapName)
+		} else {
+			principal = setupGKEWIPrincipal(wifKSA)
+		}
 
 		ginkgo.By("Granting read-only (objectViewer) access to bucket")
-		grantBucketAccess(bucketName, authCtx.principal, "roles/storage.objectViewer")
-		defer revokeBucketAccess(bucketName, authCtx.principal, "roles/storage.objectViewer")
+		grantBucketAccess(bucketName, principal, "roles/storage.objectViewer")
+		defer revokeBucketAccess(bucketName, principal, "roles/storage.objectViewer")
 
 		ginkgo.By("Waiting for IAM policy propagation")
 		time.Sleep(5 * time.Second)
 
-		ginkgo.By("Deploying test pod with WI credentials and read-only bucket access")
-		tPod := deployWIFPod(authCtx)
+		tPod := deployWIFPod(wifKSA, func() string {
+			if isOSS {
+				return configMapName
+			}
+			return ""
+		}(), volumeName, mountPath)
 		defer tPod.Cleanup(ctx)
 
-		ginkgo.By("Checking that the pod is running")
 		tPod.WaitForRunning(ctx)
 
 		ginkgo.By("Verifying read operations succeed with objectViewer role")
 		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
-			fmt.Sprintf("ls %v", wifMountPath))
+			fmt.Sprintf("ls %v", mountPath))
 
 		ginkgo.By("Verifying write operations fail with objectViewer role")
 		tPod.VerifyExecInPodFail(f, specs.TesterContainerName,
-			fmt.Sprintf("echo 'write-test' > %v/wif-write-test.txt", wifMountPath), 1)
-	}
+			fmt.Sprintf("echo 'write-test' > %v/wif-write-test.txt", mountPath), 1)
+	})
 
-	// testCaseWIFRoleOnDifferentBucket verifies that GCS access fails when the WI principal's
-	// IAM role is on a different bucket than the one being mounted.
-	testCaseWIFRoleOnDifferentBucket := func() {
+	ginkgo.It("should fail GCS access when WI principal role is on a different bucket", func() {
 		init(specs.SkipCSIBucketAccessCheckPrefix)
 		defer cleanup()
 
 		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
 		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attributes")
 
-		projectID := os.Getenv(utils.ProjectEnvVar)
-		authCtx := setupWIAuth(wifWrongBucketConfigMapName)
-		defer cleanupWIAuth(authCtx)
+		const (
+			wifKSA        = "wif-wrong-bucket-ksa"
+			configMapName = "wif-credentials-wrong-bucket"
+			volumeName    = "gcs-wif-volume"
+			mountPath     = "/mnt/gcs"
+		)
+
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
+		rawProjectID := os.Getenv(utils.ProjectEnvVar)
+		lines := strings.Split(strings.TrimSpace(rawProjectID), "\n")
+		projectID := lines[len(lines)-1]
+
+		var principal string
+		if isOSS {
+			principal = setupOSSWIFPrincipal(wifKSA, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, configMapName)
+		} else {
+			principal = setupGKEWIPrincipal(wifKSA)
+		}
 
 		altBucket := fmt.Sprintf("gcs-fuse-wif-alt-%s", f.Namespace.Name)
 		ginkgo.By(fmt.Sprintf("Creating alternate bucket: %s", altBucket))
-		createCmd := exec.Command("gcloud", "storage", "buckets", "create",
-			"gs://"+altBucket, "--project="+projectID)
-		if out, err := createCmd.CombinedOutput(); err != nil {
+		if out, err := exec.Command("gcloud", "storage", "buckets", "create", "gs://"+altBucket, "--project="+projectID).CombinedOutput(); err != nil {
 			klog.Warningf("Failed to create alternate bucket %s: %v, output: %s", altBucket, err, string(out))
 		}
 		defer func() {
-			ginkgo.By(fmt.Sprintf("Deleting alternate bucket: %s", altBucket))
-			deleteCmd := exec.Command("gcloud", "storage", "buckets", "delete",
-				"gs://"+altBucket, "--project="+projectID, "--quiet")
-			if out, err := deleteCmd.CombinedOutput(); err != nil {
+			if out, err := exec.Command("gcloud", "storage", "buckets", "delete", "gs://"+altBucket, "--project="+projectID, "--quiet").CombinedOutput(); err != nil {
 				klog.Warningf("Failed to delete alternate bucket %s: %v, output: %s", altBucket, err, string(out))
 			}
 		}()
 
-		ginkgo.By(fmt.Sprintf("Granting objectUser access on alternate bucket %s (not on test bucket %s)", altBucket, bucketName))
-		grantBucketAccess(altBucket, authCtx.principal, "roles/storage.objectUser")
-		defer revokeBucketAccess(altBucket, authCtx.principal, "roles/storage.objectUser")
+		ginkgo.By(fmt.Sprintf("Granting objectUser on alternate bucket %s (not on test bucket %s)", altBucket, bucketName))
+		grantBucketAccess(altBucket, principal, "roles/storage.objectUser")
+		defer revokeBucketAccess(altBucket, principal, "roles/storage.objectUser")
 
 		ginkgo.By("Waiting for IAM policy propagation")
 		time.Sleep(5 * time.Second)
 
-		ginkgo.By("Deploying test pod mounting test bucket where WI principal has no access")
-		tPod := deployWIFPod(authCtx)
+		tPod := deployWIFPod(wifKSA, func() string {
+			if isOSS {
+				return configMapName
+			}
+			return ""
+		}(), volumeName, mountPath)
 		defer tPod.Cleanup(ctx)
 
 		if os.Getenv(utils.TestWithSidecarBucketAccessCheckEnvVar) == "true" {
-			// Sidecar bucket access check fires at mount time: the pod stays Pending
-			// with a PermissionDenied FailedMount event — it never reaches Running.
 			ginkgo.By("Checking that the sidecar bucket access check returns PermissionDenied")
 			tPod.WaitForFailedMountError(ctx, "PermissionDenied")
 		} else {
@@ -332,96 +356,216 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 			ginkgo.By("Checking that gcsfuse logs a permission denied error for the test bucket")
 			tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PermissionDenied")
 		}
-	}
-
-	ginkgo.It("should fail GCS access when WI principal has no storage role", func() {
-		testCaseWIFNoStorageRole()
 	})
 
-	ginkgo.It("should fail write operations when WI principal has read-only storage role", func() {
-		testCaseWIFReadOnlyRoleWriteFails()
-	})
+	ginkgo.It("should fail GCS access after workload identity federation principal permissions are removed while pod is running", func() {
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
 
-	ginkgo.It("should fail GCS access when WI principal role is on a different bucket", func() {
-		testCaseWIFRoleOnDifferentBucket()
-	})
-
-}
-
-// wifGSANameForNamespace returns a GSA name derived from the test namespace.
-// GSA names are project-scoped and limited to 30 characters.
-// Prefix "gcs-fuse-wif-" is 13 chars; we use up to 17 chars of the namespace.
-func wifGSANameForNamespace(namespace string) string {
-	suffix := namespace
-	if len(suffix) > 17 {
-		suffix = suffix[:17]
-	}
-	return fmt.Sprintf("gcs-fuse-wif-%s", suffix)
-}
-
-// createGSAForWIF creates a Google Service Account for WIF tests and returns its email.
-// Ignores "already exists" errors so tests can be re-run without prior cleanup.
-func createGSAForWIF(projectID, gsaName string) string {
-	gsaEmail := fmt.Sprintf("%s@%s.iam.gserviceaccount.com", gsaName, projectID)
-	cmd := exec.Command("gcloud", "iam", "service-accounts", "create", gsaName,
-		"--project="+projectID,
-		"--display-name=GCS FUSE WIF Test GSA")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		if !strings.Contains(string(output), "already exists") {
-			klog.Warningf("Failed to create GSA %q: %v, output: %s", gsaName, err, string(output))
+		// OSS: credential ConfigMap doesn't exist at mount time, so the CSI pre-mount
+		// bucket access check would fail — skip it and let authz errors surface on I/O.
+		// GKE: WI binding and bucket access are both ready before the pod starts, so the
+		// pre-mount check can run normally.
+		if isOSS {
+			initWithCSIBucketAccessCheckSkipped()
+		} else {
+			init()
 		}
-	} else {
-		klog.Infof("Created GSA: %s", gsaEmail)
-	}
-	return gsaEmail
-}
+		defer cleanup()
 
-// deleteGSAForWIF deletes a Google Service Account.
-func deleteGSAForWIF(projectID, gsaEmail string) {
-	cmd := exec.Command("gcloud", "iam", "service-accounts", "delete", gsaEmail,
-		"--project="+projectID,
-		"--quiet")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		klog.Warningf("Failed to delete GSA %q: %v, output: %s", gsaEmail, err, string(output))
-	} else {
-		klog.Infof("Deleted GSA: %s", gsaEmail)
-	}
-}
+		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
+		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attributes")
 
-// bindKSAToGSAForWIF grants roles/iam.workloadIdentityUser on the GSA to the KSA,
-// enabling the KSA to impersonate the GSA via GKE native Workload Identity.
-func bindKSAToGSAForWIF(projectID, gsaEmail, namespace, ksaName string) {
-	member := fmt.Sprintf("serviceAccount:%s.svc.id.goog[%s/%s]", projectID, namespace, ksaName)
-	cmd := exec.Command("gcloud", "iam", "service-accounts", "add-iam-policy-binding", gsaEmail,
-		"--project="+projectID,
-		"--role=roles/iam.workloadIdentityUser",
-		"--member="+member)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		klog.Errorf("Failed to bind KSA %s/%s to GSA %s: %v, output: %s", namespace, ksaName, gsaEmail, err, string(output))
-		framework.Failf("Failed to bind KSA to GSA: %v", err)
-	} else {
-		klog.Infof("Bound KSA %s/%s to GSA %s", namespace, ksaName, gsaEmail)
-	}
-}
+		const (
+			wifKSA     = "wif-revoke-ksa"
+			volumeName = "gcs-volume"
+			mountPath  = "/mnt/gcs"
+		)
 
-// createServiceAccountWithGSAAnnotationForWIF creates a K8s ServiceAccount annotated with the
-// GSA email, enabling GKE native Workload Identity for pods running as this service account.
-func createServiceAccountWithGSAAnnotationForWIF(ctx context.Context, f *framework.Framework, ksaName, gsaEmail string) {
-	sa := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ksaName,
-			Namespace: f.Namespace.Name,
-			Annotations: map[string]string{
-				"iam.gke.io/gcp-service-account": gsaEmail,
+		var (
+			principal               string
+			credentialConfigMapName string
+			permissionRevoked       bool
+		)
+
+		if isOSS {
+			credentialConfigMapName = "wif-revoke-credentials"
+			principal = setupOSSWIFPrincipal(wifKSA, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, credentialConfigMapName)
+		} else {
+			principal = setupGKEWIPrincipal(wifKSA)
+		}
+
+		ginkgo.By("Granting bucket access to workload identity principal")
+		grantBucketAccess(bucketName, principal, "roles/storage.objectUser")
+		defer func() {
+			if !permissionRevoked {
+				revokeBucketAccess(bucketName, principal, "roles/storage.objectUser")
+			}
+		}()
+
+		ginkgo.By("Waiting for IAM policy and WIF infrastructure propagation")
+		time.Sleep(2 * time.Minute)
+
+		// The pod continuously writes 10 MB chunks as separate GCS objects. Each chunk close
+		// triggers a GCS upload which is IAM-checked. When permission is revoked the next
+		// upload returns 403 and dd exits non-zero, stopping the loop.
+		ginkgo.By("Creating and deploying test pod with continuous write loop")
+		tPod := specs.NewTestPodModifiedSpec(f.ClientSet, f.Namespace, true)
+		tPod.SetServiceAccount(wifKSA)
+		tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+		if credentialConfigMapName != "" {
+			tPod.SetAnnotations(map[string]string{
+				webhook.GCPWorkloadIdentityCredentialConfigMapAnnotation: credentialConfigMapName,
+			})
+		}
+		tPod.SetCommand(fmt.Sprintf(
+			"i=0; while true; do "+
+				"i=$((i+1)); "+
+				"dd if=/dev/urandom bs=1M count=10 of=%s/chunk-$i.bin 2>&1; "+
+				"if [ $? -ne 0 ]; then "+
+				"echo WRITE_FAILED; "+
+				"sleep 5; "+
+				"fi; "+
+				"done",
+			mountPath,
+		))
+		tPod.SetRestartPolicy(corev1.RestartPolicyNever)
+		tPod.Create(ctx)
+		defer tPod.Cleanup(ctx)
+
+		ginkgo.By("Waiting for pod to reach Running state")
+		tPod.WaitForRunning(ctx)
+
+		ginkgo.By("Polling until at least one chunk is written to GCS (confirms active writes before revocation)")
+		preRevokeCtx, cancelPreRevoke := context.WithTimeout(ctx, 2*time.Minute)
+		defer cancelPreRevoke()
+		chunkWritten := false
+		_ = wait.PollUntilContextCancel(preRevokeCtx, 5*time.Second, true, func(_ context.Context) (bool, error) {
+			output := tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName,
+				fmt.Sprintf("test -f %s/chunk-1.bin && echo WRITTEN || echo PENDING", mountPath))
+			if strings.Contains(output, "WRITTEN") {
+				chunkWritten = true
+				return true, nil
+			}
+			return false, nil
+		})
+		gomega.Expect(chunkWritten).To(gomega.BeTrue(),
+			"expected pod to write at least one chunk to GCS before permission revocation")
+
+		ginkgo.By("Revoking bucket access while pod is actively writing")
+		revokeBucketAccess(bucketName, principal, "roles/storage.objectUser")
+		permissionRevoked = true
+
+		ginkgo.By("Waiting for IAM revocation to propagate")
+		time.Sleep(20 * time.Second)
+
+		ginkgo.By("Waiting until writes stop progressing")
+		var countStable bool
+		_ = wait.PollUntilContextTimeout(ctx, 10*time.Second, 2*time.Minute, true,
+			func(ctx context.Context) (bool, error) {
+				out1 := tPod.VerifyExecInPodSucceedWithOutput(
+					f, specs.TesterContainerName,
+					fmt.Sprintf("ls %s/chunk-* 2>/dev/null | wc -l", mountPath),
+				)
+				time.Sleep(10 * time.Second)
+				out2 := tPod.VerifyExecInPodSucceedWithOutput(
+					f, specs.TesterContainerName,
+					fmt.Sprintf("ls %s/chunk-* 2>/dev/null | wc -l", mountPath),
+				)
+				if strings.TrimSpace(out1) == strings.TrimSpace(out2) {
+					countStable = true
+					return true, nil
+				}
+				return false, nil
 			},
+		)
+		gomega.Expect(countStable).To(gomega.BeTrue(),
+			"expected writes to stop after permission revocation")
+
+		ginkgo.By("Verifying GCS FUSE sidecar logs contain a 403 Forbidden error")
+		sidecarLogReq := f.ClientSet.CoreV1().Pods(f.Namespace.Name).GetLogs(tPod.GetPodName(), &corev1.PodLogOptions{
+			Container: webhook.GcsFuseSidecarName,
+		})
+		sidecarLogBytes, err := sidecarLogReq.DoRaw(ctx)
+		framework.ExpectNoError(err, "fetching GCS FUSE sidecar logs")
+		sidecarLogs := strings.ToLower(string(sidecarLogBytes))
+		gomega.Expect(
+			strings.Contains(sidecarLogs, "403") || strings.Contains(sidecarLogs, "forbidden"),
+		).To(gomega.BeTrue(),
+			"expected GCS FUSE sidecar logs to contain '403' or 'forbidden' after permission revocation;\nsidecar logs: %s", string(sidecarLogBytes))
+	})
+}
+
+// addWorkloadIdentityBinding grants roles/iam.workloadIdentityUser on the given GCP service
+// account to the Workload Identity principal for ksaName, enabling GKE token exchange.
+// Retries with backoff to handle IAM eventual consistency after SA creation.
+func addWorkloadIdentityBinding(ctx context.Context, gcpSAEmail, projectID, namespace, ksaName string) {
+	iamService, err := iam.NewService(ctx)
+	framework.ExpectNoError(err, "creating IAM service")
+	saResourceName := fmt.Sprintf("projects/%s/serviceAccounts/%s", projectID, gcpSAEmail)
+	member := fmt.Sprintf("serviceAccount:%s.svc.id.goog[%s/%s]", projectID, namespace, ksaName)
+
+	err = wait.PollUntilContextTimeout(ctx, 10*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		policy, e := iamService.Projects.ServiceAccounts.GetIamPolicy(saResourceName).Do()
+		if e != nil {
+			klog.Warningf("GetIamPolicy for %s not ready yet: %v — retrying", gcpSAEmail, e)
+			return false, nil
+		}
+		alreadyBound := false
+		for _, b := range policy.Bindings {
+			if b.Role == "roles/iam.workloadIdentityUser" {
+				for _, m := range b.Members {
+					if m == member {
+						alreadyBound = true
+						break
+					}
+				}
+			}
+			if alreadyBound {
+				break
+			}
+		}
+		if !alreadyBound {
+			policy.Bindings = append(policy.Bindings, &iam.Binding{
+				Role:    "roles/iam.workloadIdentityUser",
+				Members: []string{member},
+			})
+		}
+		if _, e = iamService.Projects.ServiceAccounts.SetIamPolicy(saResourceName, &iam.SetIamPolicyRequest{Policy: policy}).Do(); e != nil {
+			klog.Warningf("SetIamPolicy for %s failed: %v — retrying", gcpSAEmail, e)
+			return false, nil
+		}
+		return true, nil
+	})
+	framework.ExpectNoError(err, "setting workload identity binding for %s", gcpSAEmail)
+}
+
+// getOSSClusterOIDCIssuer discovers the cluster OIDC issuer URL by decoding a live
+// ServiceAccount token issued by the cluster. Unlike getClusterOIDCIssuer, this works
+// on any Kubernetes cluster (GKE or self-managed) without requiring cluster-name or
+// location environment variables.
+func getOSSClusterOIDCIssuer(ctx context.Context, f *framework.Framework) string {
+	expirationSecs := int64(600)
+	tok, err := f.ClientSet.CoreV1().ServiceAccounts(f.Namespace.Name).CreateToken(
+		ctx,
+		"default",
+		&authv1.TokenRequest{
+			Spec: authv1.TokenRequestSpec{ExpirationSeconds: &expirationSecs},
 		},
+		metav1.CreateOptions{},
+	)
+	framework.ExpectNoError(err, "creating service account token to discover cluster OIDC issuer")
+
+	parts := strings.Split(tok.Status.Token, ".")
+	if len(parts) != 3 {
+		framework.Failf("unexpected JWT format: want 3 parts, got %d", len(parts))
 	}
-	_, err := f.ClientSet.CoreV1().ServiceAccounts(f.Namespace.Name).Create(ctx, sa, metav1.CreateOptions{})
-	if err != nil {
-		framework.Failf("Failed to create annotated service account %s: %v", ksaName, err)
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	framework.ExpectNoError(err, "base64-decoding JWT payload")
+
+	var claims struct {
+		Issuer string `json:"iss"`
 	}
-	klog.Infof("Created annotated service account: %s (GSA: %s)", ksaName, gsaEmail)
+	framework.ExpectNoError(json.Unmarshal(payload, &claims), "unmarshalling JWT claims")
+	gomega.Expect(claims.Issuer).NotTo(gomega.BeEmpty(), "cluster OIDC issuer must not be empty")
+	return claims.Issuer
 }
