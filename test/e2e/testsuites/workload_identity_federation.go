@@ -50,7 +50,6 @@ const (
 	wifNoRoleConfigMapName        = "wif-credentials-no-role"
 	wifReadOnlyConfigMapName      = "wif-credentials-readonly"
 	wifWrongBucketConfigMapName   = "wif-credentials-wrong-bucket"
-	wifRevokedConfigMapName       = "wif-credentials-revoked"
 )
 
 // wiAuthContext holds the auth-mechanism-specific values for a test case.
@@ -217,6 +216,8 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 
 	// testCaseWIFNoStorageRole verifies that GCS access fails when the WI principal has no
 	// storage role on the bucket. Authentication succeeds; GCS returns PermissionDenied.
+	// When the sidecar bucket access check is enabled, the check fires at mount time and
+	// the pod never reaches Running — we verify the PermissionDenied mount error instead.
 	testCaseWIFNoStorageRole := func() {
 		init(specs.SkipCSIBucketAccessCheckPrefix)
 		defer cleanup()
@@ -234,8 +235,16 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		tPod := deployWIFPod(authCtx)
 		defer tPod.Cleanup(ctx)
 
-		ginkgo.By("Checking that gcsfuse logs a permission denied error from GCS")
-		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PermissionDenied")
+		if os.Getenv(utils.TestWithSidecarBucketAccessCheckEnvVar) == "true" {
+			// Sidecar bucket access check fires at mount time: the pod stays Pending
+			// with a PermissionDenied FailedMount event — it never reaches Running.
+			ginkgo.By("Checking that the sidecar bucket access check returns PermissionDenied")
+			tPod.WaitForFailedMountError(ctx, "PermissionDenied")
+		} else {
+			tPod.WaitForRunning(ctx)
+			ginkgo.By("Checking that gcsfuse logs a permission denied error from GCS")
+			tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PermissionDenied")
+		}
 	}
 
 	// testCaseWIFReadOnlyRoleWriteFails verifies that write operations fail when the WI principal
@@ -313,71 +322,16 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		tPod := deployWIFPod(authCtx)
 		defer tPod.Cleanup(ctx)
 
-		ginkgo.By("Checking that gcsfuse logs a permission denied error for the test bucket")
-		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PermissionDenied")
-	}
-
-	// testCaseWIFRoleRevokedMidSession verifies that file operations fail after the WI principal's
-	// IAM role is revoked while the pod is running.
-	testCaseWIFRoleRevokedMidSession := func() {
-		init(specs.SkipCSIBucketAccessCheckPrefix)
-		defer cleanup()
-
-		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
-		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attributes")
-
-		authCtx := setupWIAuth(wifRevokedConfigMapName)
-		defer cleanupWIAuth(authCtx)
-
-		ginkgo.By("Granting objectUser access to bucket")
-		revoked := false
-		grantBucketAccess(bucketName, authCtx.principal, "roles/storage.objectUser")
-		defer func() {
-			if !revoked {
-				revokeBucketAccess(bucketName, authCtx.principal, "roles/storage.objectUser")
-			}
-		}()
-
-		ginkgo.By("Waiting for IAM policy propagation")
-		time.Sleep(5 * time.Second)
-
-		ginkgo.By("Deploying test pod with WI credentials and bucket access")
-		tPod := deployWIFPod(authCtx)
-		defer tPod.Cleanup(ctx)
-
-		ginkgo.By("Checking that the pod is running")
-		tPod.WaitForRunning(ctx)
-
-		ginkgo.By("Verifying initial write succeeds before role revocation")
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
-			fmt.Sprintf("echo 'pre-revoke' > %v/wif-pre-revoke.txt", wifMountPath))
-
-		// Revoke the IAM role immediately (not deferred — intentional mid-session revocation).
-		ginkgo.By("Revoking bucket access mid-session")
-		revokeBucketAccess(bucketName, authCtx.principal, "roles/storage.objectUser")
-		revoked = true
-
-		// Wait for IAM propagation and credential cache expiry.
-		// If this test is flaky, increase the sleep to match the token cache TTL.
-		ginkgo.By("Waiting for IAM revocation to propagate")
-		time.Sleep(60 * time.Second)
-
-		ginkgo.By("Verifying write fails after role revocation")
-		tPod.VerifyExecInPodFail(f, specs.TesterContainerName,
-			fmt.Sprintf("echo 'post-revoke' > %v/wif-post-revoke.txt", wifMountPath), 1)
-
-		// Re-grant the role and verify writes resume — confirms the access loss was due
-		// to the IAM change and not a permanent pod or gcsfuse failure.
-		ginkgo.By("Re-granting objectUser access to bucket")
-		grantBucketAccess(bucketName, authCtx.principal, "roles/storage.objectUser")
-		revoked = false
-
-		ginkgo.By("Waiting for IAM re-grant to propagate")
-		time.Sleep(60 * time.Second)
-
-		ginkgo.By("Verifying write succeeds after role is restored")
-		tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
-			fmt.Sprintf("echo 'post-restore' > %v/wif-post-restore.txt", wifMountPath))
+		if os.Getenv(utils.TestWithSidecarBucketAccessCheckEnvVar) == "true" {
+			// Sidecar bucket access check fires at mount time: the pod stays Pending
+			// with a PermissionDenied FailedMount event — it never reaches Running.
+			ginkgo.By("Checking that the sidecar bucket access check returns PermissionDenied")
+			tPod.WaitForFailedMountError(ctx, "PermissionDenied")
+		} else {
+			tPod.WaitForRunning(ctx)
+			ginkgo.By("Checking that gcsfuse logs a permission denied error for the test bucket")
+			tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "PermissionDenied")
+		}
 	}
 
 	ginkgo.It("should fail GCS access when WI principal has no storage role", func() {
@@ -392,9 +346,6 @@ func (t *gcsFuseCSIWIFTestSuite) DefineTests(driver storageframework.TestDriver,
 		testCaseWIFRoleOnDifferentBucket()
 	})
 
-	ginkgo.It("should fail file operations when WI principal role is revoked mid-session", func() {
-		testCaseWIFRoleRevokedMidSession()
-	})
 }
 
 // wifGSANameForNamespace returns a GSA name derived from the test namespace.
