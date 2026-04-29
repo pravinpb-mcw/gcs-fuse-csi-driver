@@ -191,8 +191,105 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
 		return tPod
 	}
 
+	ginkgo.It("should successfully authenticate multiple pods using same federation configuration", func() {
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
+
+		if isOSS {
+        	init(specs.SkipCSIBucketAccessCheckPrefix)
+		} else {
+			init()
+		}
+		defer cleanup()
+
+		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
+		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attributes")
+
+		const (
+			wifKSA     = "wif-multi-pod-ksa"
+			volumeName = "gcs-volume"
+			mountPath  = "/mnt/gcs"
+			podCount   = 3
+		)
+
+		var (
+			principal               string
+			credentialConfigMapName string
+		)
+
+		if isOSS {
+			credentialConfigMapName = "wif-multi-pod-credentials"
+			principal = setupOSSWIFPrincipal(wifKSA, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, credentialConfigMapName)
+		} else {
+			principal = setupGKEWIPrincipal(wifKSA)
+		}
+
+		ginkgo.By("Granting bucket access to workload identity principal")
+		grantBucketAccess(bucketName, principal, "roles/storage.objectAdmin")
+		defer revokeBucketAccess(bucketName, principal, "roles/storage.objectAdmin")
+
+		ginkgo.By("Waiting for IAM policy propagation")
+		time.Sleep(2 * time.Minute)
+
+		tPods := make([]*specs.TestPod, podCount)
+
+		for i := 0; i < podCount; i++ {
+			ginkgo.By(fmt.Sprintf("Configuring test pod %d with same federation config", i))
+			tPod := specs.NewTestPodModifiedSpec(f.ClientSet, f.Namespace, true)
+			tPod.SetServiceAccount(wifKSA)
+			tPod.SetupVolume(l.volumeResource, volumeName, mountPath, false)
+			if credentialConfigMapName != "" {
+				tPod.SetAnnotations(map[string]string{
+					webhook.GCPWorkloadIdentityCredentialConfigMapAnnotation: credentialConfigMapName,
+				})
+			}
+			tPods[i] = tPod
+		}
+
+		// Create all pods before waiting so they authenticate concurrently
+		for i, tPod := range tPods {
+			ginkgo.By(fmt.Sprintf("Deploying pod %d", i))
+			tPod.Create(ctx)
+			defer tPod.Cleanup(ctx)
+		}
+
+		// Verify all pods reach Running
+		for i, tPod := range tPods {
+			ginkgo.By(fmt.Sprintf("Checking pod %d is running", i))
+			tPod.WaitForRunning(ctx)
+		}
+
+		// Verify each pod can write and read on the GCS mount
+		for i, tPod := range tPods {
+			ginkgo.By(fmt.Sprintf("Verifying pod %d volume is mounted", i))
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+				fmt.Sprintf("mount | grep %v | grep rw,", mountPath))
+
+			ginkgo.By(fmt.Sprintf("Writing a test file from pod %d", i))
+			testFileName := fmt.Sprintf("multi-pod-test-file-%d.txt", i)
+			testContent := fmt.Sprintf("Hello from pod %d with same federation config!", i)
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+				fmt.Sprintf("echo '%s' > %s/%s", testContent, mountPath, testFileName))
+
+			ginkgo.By(fmt.Sprintf("Reading the test file from pod %d", i))
+			readOutput := tPod.VerifyExecInPodSucceedWithOutput(f, specs.TesterContainerName,
+				fmt.Sprintf("cat %s/%s", mountPath, testFileName))
+			gomega.Expect(strings.TrimSpace(readOutput)).To(gomega.Equal(testContent))
+
+			ginkgo.By(fmt.Sprintf("Cleaning up test file from pod %d", i))
+			tPod.VerifyExecInPodSucceed(f, specs.TesterContainerName,
+				fmt.Sprintf("rm %s/%s", mountPath, testFileName))
+		}
+
+		ginkgo.By("All pods successfully authenticated using the same federation configuration")
+	})
+
 	ginkgo.It("should fail GCS access when WI principal has no storage role", func() {
-		init(specs.SkipCSIBucketAccessCheckPrefix)
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
+		if isOSS {
+			init(specs.SkipCSIBucketAccessCheckPrefix)
+		} else {
+			init()
+		}
 		defer cleanup()
 
 		const (
@@ -201,8 +298,6 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
 			volumeName    = "gcs-wif-volume"
 			mountPath     = "/mnt/gcs"
 		)
-
-		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
 		var principal string
 		if isOSS {
 			principal = setupOSSWIFPrincipal(wifKSA, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, configMapName)
@@ -229,7 +324,12 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
 	})
 
 	ginkgo.It("should fail write operations when WI principal has read-only storage role", func() {
-		init(specs.SkipCSIBucketAccessCheckPrefix)
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
+		if isOSS {
+			init(specs.SkipCSIBucketAccessCheckPrefix)
+		} else {
+			init()
+		}
 		defer cleanup()
 
 		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
@@ -241,8 +341,6 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
 			volumeName    = "gcs-wif-volume"
 			mountPath     = "/mnt/gcs"
 		)
-
-		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
 		var principal string
 		if isOSS {
 			principal = setupOSSWIFPrincipal(wifKSA, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, configMapName)
@@ -276,7 +374,12 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
 	})
 
 	ginkgo.It("should fail GCS access when WI principal role is on a different bucket", func() {
-		init(specs.SkipCSIBucketAccessCheckPrefix)
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
+		if isOSS {
+			init(specs.SkipCSIBucketAccessCheckPrefix)
+		} else {
+			init()
+		}
 		defer cleanup()
 
 		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
@@ -289,7 +392,6 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
 			mountPath     = "/mnt/gcs"
 		)
 
-		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
 		rawProjectID := os.Getenv(utils.ProjectEnvVar)
 		lines := strings.Split(strings.TrimSpace(rawProjectID), "\n")
 		projectID := lines[len(lines)-1]
@@ -338,7 +440,12 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
 
 
 	ginkgo.It("should re-authenticate successfully after pod restart using federation", func() {
-		init(specs.SkipCSIBucketAccessCheckPrefix)
+		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
+		if isOSS {
+			init(specs.SkipCSIBucketAccessCheckPrefix)
+		} else {
+			init()
+		}
 		defer cleanup()
 
 		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
@@ -350,8 +457,6 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
 			volumeName    = "gcs-wif-volume"
 			mountPath     = "/mnt/gcs"
 		)
-
-		isOSS := os.Getenv(utils.IsOSSEnvVar) == "true"
 		var principal string
 		if isOSS {
 			principal = setupOSSWIFPrincipal(wifKSA, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, configMapName)
