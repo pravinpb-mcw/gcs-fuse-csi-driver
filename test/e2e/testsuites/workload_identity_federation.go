@@ -35,8 +35,7 @@ import (
  metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
  utilerrors "k8s.io/apimachinery/pkg/util/errors"
  "k8s.io/apimachinery/pkg/util/wait"
- clientset "k8s.io/client-go/kubernetes"
- klog "k8s.io/klog/v2"
+klog "k8s.io/klog/v2"
  "k8s.io/kubernetes/test/e2e/framework"
  e2evolume "k8s.io/kubernetes/test/e2e/framework/volume"
  storageframework "k8s.io/kubernetes/test/e2e/storage/framework"
@@ -248,12 +247,12 @@ func (t *gcsFuseCSIWorkloadIdentityFederationTestSuite) DefineTests(driver stora
    ns1Principal, credentialConfig = setupOSSWIFPrincipal(sharedKSAName, wifWorkloadIdentityPoolID, wifWorkloadIdentityProviderID, credentialConfigMapName)
 
    ginkgo.By(fmt.Sprintf("Creating Kubernetes service account %s in ns-2 (%s)", sharedKSAName, ns2.Name))
-   createServiceAccountInNamespace(ctx, f.ClientSet, ns2.Name, sharedKSAName)
-   ginkgo.DeferCleanup(func() { deleteServiceAccountInNamespace(ctx, f.ClientSet, ns2.Name, sharedKSAName) })
+   createServiceAccount(ctx, f, sharedKSAName, ns2.Name)
+   ginkgo.DeferCleanup(func() { deleteServiceAccount(ctx, f, sharedKSAName, ns2.Name) })
 
    ginkgo.By(fmt.Sprintf("Creating credential ConfigMap %s in ns-2 (%s) — same WIF pool/provider, distinct subject", credentialConfigMapName, ns2.Name))
-   createCredentialConfigMapInNamespace(ctx, f.ClientSet, ns2.Name, credentialConfigMapName, credentialConfig)
-   ginkgo.DeferCleanup(func() { deleteCredentialConfigMapInNamespace(ctx, f.ClientSet, ns2.Name, credentialConfigMapName) })
+   createCredentialConfigMap(ctx, f, credentialConfigMapName, credentialConfig, ns2.Name)
+   ginkgo.DeferCleanup(func() { deleteConfigMap(ctx, f, credentialConfigMapName, ns2.Name) })
   } else {
    // GKE: both KSAs are annotated with dedicated GSAs and have roles/iam.workloadIdentityUser
    // bindings, preventing any fallback to the node's default service account.
@@ -444,50 +443,4 @@ func addWorkloadIdentityBinding(ctx context.Context, gcpSAEmail, projectID, name
  framework.ExpectNoError(err, "setting workload identity binding for %s", gcpSAEmail)
 }
 
-// createServiceAccountInNamespace creates a Kubernetes ServiceAccount in the given namespace.
-func createServiceAccountInNamespace(ctx context.Context, c clientset.Interface, namespace, name string) {
- sa := &corev1.ServiceAccount{
-  ObjectMeta: metav1.ObjectMeta{
-   Name:      name,
-   Namespace: namespace,
-  },
- }
- _, err := c.CoreV1().ServiceAccounts(namespace).Create(ctx, sa, metav1.CreateOptions{})
- if err != nil {
-  framework.Failf("failed to create service account %s in namespace %s: %v", name, namespace, err)
- }
- klog.Infof("Created service account %s in namespace %s", name, namespace)
-}
-
-// deleteServiceAccountInNamespace deletes a Kubernetes ServiceAccount from the given namespace.
-func deleteServiceAccountInNamespace(ctx context.Context, c clientset.Interface, namespace, name string) {
- if err := c.CoreV1().ServiceAccounts(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
-  klog.Warningf("failed to delete service account %s in namespace %s: %v", name, namespace, err)
- }
-}
-
-// createCredentialConfigMapInNamespace creates a credential ConfigMap in the given namespace.
-func createCredentialConfigMapInNamespace(ctx context.Context, c clientset.Interface, namespace, name, credentialConfig string) {
- cm := &corev1.ConfigMap{
-  ObjectMeta: metav1.ObjectMeta{
-   Name:      name,
-   Namespace: namespace,
-  },
-  Data: map[string]string{
-   oidcCredentialConfigFileName: credentialConfig,
-  },
- }
- _, err := c.CoreV1().ConfigMaps(namespace).Create(ctx, cm, metav1.CreateOptions{})
- if err != nil {
-  framework.Failf("failed to create ConfigMap %s in namespace %s: %v", name, namespace, err)
- }
- klog.Infof("Created ConfigMap %s in namespace %s", name, namespace)
-}
-
-// deleteCredentialConfigMapInNamespace deletes a credential ConfigMap from the given namespace.
-func deleteCredentialConfigMapInNamespace(ctx context.Context, c clientset.Interface, namespace, name string) {
- if err := c.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
-  klog.Warningf("failed to delete ConfigMap %s in namespace %s: %v", name, namespace, err)
- }
-}
  

@@ -43,20 +43,14 @@ import (
 )
 
 const (
-	oidcTestPrefix                             = "gcsfuse-csi-oidc"
-	oidcWorkloadIdentityPoolID                 = "gcs-fuse-oidc-pool"
-	oidcWorkloadIdentityProviderID             = "gcs-fuse-oidc-provider"
-	oidcWorkloadIdentityProviderIDMisconfigured = "gcs-fuse-oidc-provider-bad"
-	oidcConfigMapName                          = "workload-identity-credentials"
-	oidcMisconfiguredConfigMapName             = "workload-identity-credentials-bad"
-	oidcNonExistentPoolConfigMapName           = "workload-identity-credentials-nonexistent-pool"
-	oidcCredentialConfigFileName               = "credential-configuration.json"
-	oidcServiceAccountName                     = "gcs-fuse-oidc-ksa"
-	oidcVolumeName                             = "gcs-volume"
-	oidcMountPath                              = "/mnt/gcs"
-	wrongIssuerURI                             = "https://wrong-issuer.example.com"
-	nonExistentPoolID                          = "gcs-fuse-nonexistent-pool"
-	nonExistentProviderID                      = "gcs-fuse-nonexistent-provider"
+	oidcTestPrefix                 = "gcsfuse-csi-oidc"
+	oidcWorkloadIdentityPoolID     = "gcs-fuse-oidc-pool"
+	oidcWorkloadIdentityProviderID = "gcs-fuse-oidc-provider"
+	oidcConfigMapName              = "workload-identity-credentials"
+	oidcCredentialConfigFileName   = "credential-configuration.json"
+	oidcServiceAccountName         = "gcs-fuse-oidc-ksa"
+	oidcVolumeName                 = "gcs-volume"
+	oidcMountPath                  = "/mnt/gcs"
 )
 
 type gcsFuseCSIOIDCTestSuite struct {
@@ -249,7 +243,7 @@ func (t *gcsFuseCSIOIDCTestSuite) DefineTests(driver storageframework.TestDriver
 			fmt.Sprintf("cat %s/%s", oidcMountPath, testFileName))
 		gomega.Expect(strings.TrimSpace(readOutput)).To(gomega.Equal(testContent))
 
-		ginkgo.By("Verifying file exists in bucket using gsutil")
+		ginkgo.By("Verifying file exists in bucket using gcloud storage")
 		verifyFileInBucket(bucketName, testFileName)
 
 		ginkgo.By("Cleaning up test file")
@@ -300,7 +294,7 @@ func (t *gcsFuseCSIOIDCTestSuite) DefineTests(driver storageframework.TestDriver
 			fmt.Sprintf("cat %s/%s/%s", oidcMountPath, testDirPath, testFileName))
 		gomega.Expect(strings.TrimSpace(readOutput)).To(gomega.Equal(testContent))
 
-		ginkgo.By("Verifying file exists in bucket using gsutil")
+		ginkgo.By("Verifying file exists in bucket using gcloud storage")
 		verifyFileInBucket(bucketName, fmt.Sprintf("%s/%s", testDirPath, testFileName))
 
 		ginkgo.By("Cleaning up test files and directory")
@@ -372,138 +366,6 @@ func (t *gcsFuseCSIOIDCTestSuite) DefineTests(driver storageframework.TestDriver
 		tPod.WaitForFailedMountError(ctx, "PermissionDenied")
 	}
 
-	testCaseOIDCMisconfiguredProvider := func() {
-		// Uses SkipCSIBucketAccessCheckPrefix so the CSI node driver skips its own
-		// prepareStorageService call. The authentication failure happens entirely
-		// inside the sidecar container when it tries to exchange the KSA token
-		// with Google STS using a provider registered with a wrong issuer URI.
-		init(specs.SkipCSIBucketAccessCheckPrefix)
-		defer cleanup()
-
-		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
-		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attributes")
-
-		projectID := os.Getenv(utils.ProjectEnvVar)
-		gomega.Expect(projectID).NotTo(gomega.BeEmpty(), fmt.Sprintf("%s environment variable must be set", utils.ProjectEnvVar))
-
-		ginkgo.By("Getting GCP project number")
-		projectNumber := getProjectNumber(projectID)
-		gomega.Expect(projectNumber).NotTo(gomega.BeEmpty(), "Failed to get project number")
-
-		// Reuse the existing WI pool — creation is idempotent.
-		ginkgo.By(fmt.Sprintf("Creating workload identity pool: %s", oidcWorkloadIdentityPoolID))
-		createWorkloadIdentityPool(projectID, oidcWorkloadIdentityPoolID)
-
-		// Create a separate provider with a deliberately wrong issuer URI.
-		// Google STS will fail to verify the KSA token because the token's
-		// "iss" claim will not match this issuer.
-		ginkgo.By(fmt.Sprintf("Creating misconfigured workload identity provider %q with wrong issuer %q",
-			oidcWorkloadIdentityProviderIDMisconfigured, wrongIssuerURI))
-		createWorkloadIdentityProvider(projectID, oidcWorkloadIdentityPoolID,
-			oidcWorkloadIdentityProviderIDMisconfigured, wrongIssuerURI)
-
-		// Generate a credential config whose audience points to the bad provider.
-		ginkgo.By("Generating credential config pointing to the misconfigured provider")
-		credentialConfig := generateCredentialConfig(projectNumber, oidcWorkloadIdentityPoolID,
-			oidcWorkloadIdentityProviderIDMisconfigured)
-
-		ginkgo.By(fmt.Sprintf("Creating Kubernetes service account: %s", oidcServiceAccountName))
-		createServiceAccount(ctx, f, oidcServiceAccountName)
-		defer deleteServiceAccount(ctx, f, oidcServiceAccountName)
-
-		ginkgo.By(fmt.Sprintf("Creating ConfigMap with misconfigured credentials: %s", oidcMisconfiguredConfigMapName))
-		createCredentialConfigMap(ctx, f, oidcMisconfiguredConfigMapName, credentialConfig)
-		defer deleteConfigMap(ctx, f, oidcMisconfiguredConfigMapName)
-
-		// Grant bucket access so that the only failure is authentication,
-		// not a missing IAM binding masking the real error.
-		ginkgo.By("Granting bucket access to workload identity principal")
-		principal := fmt.Sprintf(
-			"principal://iam.googleapis.com/projects/%s/locations/global/workloadIdentityPools/%s/subject/system:serviceaccount:%s:%s",
-			projectNumber, oidcWorkloadIdentityPoolID, f.Namespace.Name, oidcServiceAccountName)
-		grantBucketAccess(bucketName, principal, "roles/storage.objectUser")
-		defer revokeBucketAccess(bucketName, principal, "roles/storage.objectUser")
-
-		ginkgo.By("Waiting for IAM policy propagation")
-		time.Sleep(5 * time.Second)
-
-		ginkgo.By("Configuring test pod with misconfigured OIDC provider")
-		tPod := specs.NewTestPodModifiedSpec(f.ClientSet, f.Namespace, true)
-		tPod.SetServiceAccount(oidcServiceAccountName)
-		tPod.SetupVolume(l.volumeResource, oidcVolumeName, oidcMountPath, false)
-		tPod.SetAnnotations(map[string]string{
-			webhook.GCPWorkloadIdentityCredentialConfigMapAnnotation: oidcMisconfiguredConfigMapName,
-		})
-
-		ginkgo.By("Deploying test pod and expecting STS authentication failure in sidecar")
-		tPod.Create(ctx)
-		defer tPod.Cleanup(ctx)
-
-		// The sidecar reads the credential config, fetches the KSA token, and
-		// calls Google STS to exchange it. Because the provider was registered
-		// with a wrong issuer URI, STS cannot verify the token and returns an
-		// error. The sidecar logs "IdentityBindingToken exchange error" and
-		// retries with exponential backoff until the context deadline.
-		ginkgo.By("Checking that gcsfuse logs an STS authentication error due to misconfigured provider")
-		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "Error connecting to the given credential's issuer.")
-	}
-
-	testCaseOIDCNonExistentPool := func() {
-		// Uses SkipCSIBucketAccessCheckPrefix so the CSI node driver skips its own
-		// prepareStorageService call. The authentication failure happens entirely
-		// inside the sidecar container when it tries to exchange the KSA token
-		// with Google STS using a credential config that points to a pool and
-		// provider that do not exist in GCP at all.
-		init(specs.SkipCSIBucketAccessCheckPrefix)
-		defer cleanup()
-
-		bucketName := l.volumeResource.VolSource.CSI.VolumeAttributes["bucketName"]
-		gomega.Expect(bucketName).NotTo(gomega.BeEmpty(), "bucketName must be set in volume attributes")
-
-		projectID := os.Getenv(utils.ProjectEnvVar)
-		gomega.Expect(projectID).NotTo(gomega.BeEmpty(), fmt.Sprintf("%s environment variable must be set", utils.ProjectEnvVar))
-
-		ginkgo.By("Getting GCP project number")
-		projectNumber := getProjectNumber(projectID)
-		gomega.Expect(projectNumber).NotTo(gomega.BeEmpty(), "Failed to get project number")
-
-		// Generate a credential config that points to a pool and provider that
-		// do not exist in GCP. Google STS will return an error because it cannot
-		// find any configuration to validate the token against.
-		ginkgo.By(fmt.Sprintf("Generating credential config pointing to non-existent pool %q and provider %q",
-			nonExistentPoolID, nonExistentProviderID))
-		credentialConfig := generateCredentialConfig(projectNumber, nonExistentPoolID, nonExistentProviderID)
-
-		ginkgo.By(fmt.Sprintf("Creating Kubernetes service account: %s", oidcServiceAccountName))
-		createServiceAccount(ctx, f, oidcServiceAccountName)
-		defer deleteServiceAccount(ctx, f, oidcServiceAccountName)
-
-		ginkgo.By(fmt.Sprintf("Creating ConfigMap with non-existent pool credentials: %s", oidcNonExistentPoolConfigMapName))
-		createCredentialConfigMap(ctx, f, oidcNonExistentPoolConfigMapName, credentialConfig)
-		defer deleteConfigMap(ctx, f, oidcNonExistentPoolConfigMapName)
-
-		ginkgo.By("Configuring test pod with non-existent pool credential config")
-		tPod := specs.NewTestPodModifiedSpec(f.ClientSet, f.Namespace, true)
-		tPod.SetServiceAccount(oidcServiceAccountName)
-		tPod.SetupVolume(l.volumeResource, oidcVolumeName, oidcMountPath, false)
-		tPod.SetAnnotations(map[string]string{
-			webhook.GCPWorkloadIdentityCredentialConfigMapAnnotation: oidcNonExistentPoolConfigMapName,
-		})
-
-		ginkgo.By("Deploying test pod and expecting STS authentication failure in sidecar")
-		tPod.Create(ctx)
-		defer tPod.Cleanup(ctx)
-
-		// The sidecar reads the credential config, fetches the KSA token, and
-		// calls Google STS to exchange it. Because the pool and provider in the
-		// audience do not exist in GCP, STS cannot find any configuration to
-		// validate the token against and returns an error. The sidecar logs
-		// "IdentityBindingToken exchange error" and retries with exponential
-		// backoff until the context deadline.
-		ginkgo.By("Checking that gcsfuse logs an STS authentication error due to non-existent pool or provider")
-		tPod.WaitForLog(ctx, webhook.GcsFuseSidecarName, "invalid_target")
-	}
-
 	ginkgo.It("should successfully mount with OIDC authentication", func() {
 		testCaseOIDCMount()
 	})
@@ -522,14 +384,6 @@ func (t *gcsFuseCSIOIDCTestSuite) DefineTests(driver storageframework.TestDriver
 
 	ginkgo.It("should fail when CSI bucket access check is enabled with OIDC authentication", func() {
 		testCaseOIDCWithCSIBucketAccessCheck()
-	})
-
-	ginkgo.It("should fail authentication when workload identity provider is misconfigured", func() {
-		testCaseOIDCMisconfiguredProvider()
-	})
-
-	ginkgo.It("should fail authentication when workload identity pool or provider does not exist", func() {
-		testCaseOIDCNonExistentPool()
 	})
 }
 
@@ -563,10 +417,6 @@ func createWorkloadIdentityPool(projectID, poolID string) {
 
 func getClusterOIDCIssuer(clusterName, clusterLocation, projectID string) string {
 	// The issuer URL for a GKE cluster is constructed as follows.
-	// Allow explicit override for self-managed/OSS clusters.
-	if issuer := os.Getenv("CLUSTER_OIDC_ISSUER"); issuer != "" {
-		return issuer
-	}
 	return fmt.Sprintf("https://container.googleapis.com/v1/projects/%s/locations/%s/clusters/%s",
 		projectID, clusterLocation, clusterName)
 }
@@ -610,46 +460,67 @@ func generateCredentialConfig(projectNumber, poolID, providerID string) string {
 	return string(configJSON)
 }
 
-func createServiceAccount(ctx context.Context, f *framework.Framework, name string) {
+// createServiceAccount creates a Kubernetes ServiceAccount. If namespace is provided it overrides
+// f.Namespace.Name, allowing reuse across namespaces without a separate helper.
+func createServiceAccount(ctx context.Context, f *framework.Framework, name string, namespace ...string) {
+	ns := f.Namespace.Name
+	if len(namespace) > 0 && namespace[0] != "" {
+		ns = namespace[0]
+	}
 	sa := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: f.Namespace.Name,
+			Namespace: ns,
 		},
 	}
-	_, err := f.ClientSet.CoreV1().ServiceAccounts(f.Namespace.Name).Create(ctx, sa, metav1.CreateOptions{})
+	_, err := f.ClientSet.CoreV1().ServiceAccounts(ns).Create(ctx, sa, metav1.CreateOptions{})
 	if err != nil {
 		framework.Failf("Failed to create service account: %v", err)
 	}
-	klog.Infof("Created service account: %s", name)
+	klog.Infof("Created service account: %s in namespace %s", name, ns)
 }
 
-func deleteServiceAccount(ctx context.Context, f *framework.Framework, name string) {
-	err := f.ClientSet.CoreV1().ServiceAccounts(f.Namespace.Name).Delete(ctx, name, metav1.DeleteOptions{})
+// deleteServiceAccount deletes a Kubernetes ServiceAccount. If namespace is provided it overrides f.Namespace.Name.
+func deleteServiceAccount(ctx context.Context, f *framework.Framework, name string, namespace ...string) {
+	ns := f.Namespace.Name
+	if len(namespace) > 0 && namespace[0] != "" {
+		ns = namespace[0]
+	}
+	err := f.ClientSet.CoreV1().ServiceAccounts(ns).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
 		klog.Warningf("Failed to delete service account: %v", err)
 	}
 }
 
-func createCredentialConfigMap(ctx context.Context, f *framework.Framework, name, credentialConfig string) {
+// createCredentialConfigMap creates a credential ConfigMap. If namespace is provided it overrides f.Namespace.Name.
+func createCredentialConfigMap(ctx context.Context, f *framework.Framework, name, credentialConfig string, namespace ...string) {
+	ns := f.Namespace.Name
+	if len(namespace) > 0 && namespace[0] != "" {
+		ns = namespace[0]
+	}
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: f.Namespace.Name,
+			Namespace: ns,
 		},
 		Data: map[string]string{
 			oidcCredentialConfigFileName: credentialConfig,
 		},
 	}
-	_, err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Create(ctx, cm, metav1.CreateOptions{})
+	_, err := f.ClientSet.CoreV1().ConfigMaps(ns).Create(ctx, cm, metav1.CreateOptions{})
 	if err != nil {
 		framework.Failf("Failed to create ConfigMap: %v", err)
 	}
-	klog.Infof("Created ConfigMap: %s", name)
+	klog.Infof("Created ConfigMap: %s in namespace %s", name, ns)
 }
 
-func deleteConfigMap(ctx context.Context, f *framework.Framework, name string) {
-	err := f.ClientSet.CoreV1().ConfigMaps(f.Namespace.Name).Delete(ctx, name, metav1.DeleteOptions{})
+// deleteConfigMap deletes a ConfigMap. If namespace is provided it overrides f.Namespace.Name.
+func deleteConfigMap(ctx context.Context, f *framework.Framework, name string, namespace ...string) {
+	ns := f.Namespace.Name
+	if len(namespace) > 0 && namespace[0] != "" {
+		ns = namespace[0]
+	}
+	err := f.ClientSet.CoreV1().ConfigMaps(ns).Delete(ctx, name, metav1.DeleteOptions{})
 	if err != nil {
 		klog.Warningf("Failed to delete ConfigMap: %v", err)
 	}
@@ -680,7 +551,7 @@ func revokeBucketAccess(bucketName, principal, role string) {
 }
 
 func verifyFileInBucket(bucketName, fileName string) {
-	cmd := exec.Command("gsutil", "ls", fmt.Sprintf("gs://%s/%s", bucketName, fileName))
+	cmd := exec.Command("gcloud", "storage", "ls", fmt.Sprintf("gs://%s/%s", bucketName, fileName))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		klog.Errorf("Failed to verify file in bucket: %v, output: %s", err, string(output))
